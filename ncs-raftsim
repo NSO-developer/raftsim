@@ -1,0 +1,484 @@
+#!/bin/sh
+#
+# Licensed under the Apache License 2.0, see LICENSE
+#
+set -e
+
+DATADIR="./raftsim"
+
+
+if [ -n "$NCS_RAFTSIM_DIR" ]; then
+    DATADIR=$NCS_RAFTSIM_DIR
+fi
+if [ -n "$NCS_RAFTSIM_JCLI" ]; then
+    CLI_STYLE='-J'
+else
+    CLI_STYLE='-C'
+fi
+
+
+add_packages() { #(node_id)
+    if ! [ -e packages ]; then return 0; fi
+
+    for p in packages/*; do
+        if [ "$p" = 'packages/*' ] || [ "$p" = Makefile ]; then
+            : # Ignore Makefile if present
+        else
+            if ! [ -e "node$1/$p" ]; then
+                cp -a "$p" node$1/packages/
+            fi
+        fi
+    done
+}
+
+cmd_cli() { #([node_id|node_dir], [args])
+    nn=''
+    if [ $# -gt 0 ]; then
+        case $1 in
+            -*) ;;
+            *)
+                nn=$1
+                shift
+                ;;
+        esac
+    fi
+    if [ -n "$nn" ]; then
+        nid=''
+        get_node_id "$nn"
+    else
+        nid=''
+        get_leader_id 2>/dev/null
+    fi
+    if [ -z "$nid" ]; then
+        errorout 3 'no suitable leader found'
+    fi
+
+    if [ $# -eq 0 ]; then
+        set -- -u admin -g admin "$CLI_STYLE"
+    fi
+    NCS_IPC_PORT=456$nid exec ncs_cli "$@"
+}
+
+cmd_create() { #([node_id|node_dir, ...])
+    create_ca
+    create_ncs_conf_tpl
+
+    if [ $# -eq 0 ]; then
+        create_node_dirs 1 2 3
+        add_packages 1
+        add_packages 2
+        add_packages 3
+    else
+        for nd in "$@"; do
+            nid=''
+            get_node_id "$nd"
+            create_node_dirs $nid
+            add_packages "$nid"
+        done
+    fi
+}
+
+cmd_join() { #([node_id|node_dir, ...])
+    if [ $# -eq 0 ]; then
+        set -- node*
+    fi
+
+    members=''
+    first=''
+    for nd in "$@"; do
+        nid=''
+        get_node_id "$nd"
+        if [ -z "$first" ]; then
+            first=$nid
+        else
+            members="ncsd$nid@127.0.0.1 $members"
+        fi
+    done
+
+    if [ -z "$first" ]; then
+        errorout 3 'no suitable leader found'
+    fi
+    if [ -n "$members" ]; then
+        members=" member [ $members]"
+    fi
+    echo "cluster: joining nodes to cluster with leader node$first"
+    node_cli "$first" "ha-raft create-cluster$members" >join.log
+}
+
+cmd_purge() { #()
+    cmd_stop
+
+    for f in *; do
+        if [ "$f" = 'packages' ] || [ "$f" = '*' ]; then
+            :
+        else
+            rm -rf "$f"
+        fi
+    done
+    echo 'cluster: purged'
+
+    # Also delete the directory, if it's empty
+    rmdir "$(pwd)" || true
+}
+
+cmd_reset() { #([node_id|node_dir, ...])
+    if [ $# -eq 0 ]; then
+        set -- node*
+    fi
+
+    for nd in "$@"; do
+        nid=''
+        get_node_id "$nd"
+        echo "node$nid: resetting..."
+        (
+            cd "node$nid"
+            NCS_IPC_PORT=456$nid ncs --stop || true
+            ncs-setup --reset
+        ) &
+    done
+    wait
+    echo 'cluster: reset'
+}
+
+cmd_reup() { # ([cmd...])
+    cmd_create
+    cmd_reset
+    cmd_start
+    cmd_join
+
+    if [ $# -gt 0 ]; then
+        sleep 1
+        main "$@"
+    fi
+}
+
+cmd_start() { #([node_id|node_dir, ...])
+    reload=''
+    if [ "$1" = '--reload' ]; then
+        reload='--with-package-reload'
+        shift
+    fi
+    if [ "$1" = '--reload-force' ]; then
+        reload='--with-package-reload-force'
+        shift
+    fi
+
+    if [ $# -eq 0 ]; then
+        set -- node*
+    fi
+
+    for nd in "$@"; do
+        nid=''
+        get_node_id "$nd"
+        status=$(get_node_status $nid)
+        if [ -z "$status" ]; then
+            echo "node$nid: starting..."
+            (cd "node$nid"; ncs $reload) &
+        else
+            echo "node$nid: $status"
+        fi
+    done
+    wait
+    echo 'cluster: started'
+}
+
+cmd_status() { #()
+    if [ $# -eq 0 ]; then
+        set -- node*
+    fi
+
+    for nd in "$@"; do
+        nid=''
+        get_node_id "$nd"
+        status=$(get_node_status $nid)
+        if [ -z "$status" ]; then
+            echo "node$nid: status: stopped"
+        else
+            echo "node$nid: $status"
+        fi
+    done
+}
+
+cmd_stop() { #([node_id|node_dir, ...])
+    if [ $# -eq 0 ]; then
+        set -- node*
+    fi
+
+    for nd in "$@"; do
+        nid=''
+        get_node_id "$nd"
+        echo "node$nid: stopping..."
+        NCS_IPC_PORT=456$nid ncs --stop 2>/dev/null || true &
+    done
+    wait
+    echo 'cluster: stopped'
+}
+
+cmd_tls_info() { # (node_id|node_dir)
+    nid=''
+    get_node_id "$1"
+
+    nodecert="certs/ncsd$nid.crt"
+    echo "TLS files in:      $(pwd)/tls"
+    echo "CA certificate:    ca/ca.crt"
+    echo "Node certificate:  $nodecert"
+    echo "Node private key:  keys/ncsd$nid.key"
+    echo ""
+    openssl x509 -in "tls/$nodecert" -noout -text
+    echo ""
+    openssl verify -CAfile tls/ca/ca.crt "tls/$nodecert"
+}
+
+cmd_up() { # ([cmd...])
+    cmd_create
+    cmd_start
+    
+    nid=''
+    get_leader_id 2>/dev/null
+    if [ -z "$nid" ]; then
+        cmd_join
+    fi
+
+    if [ $# -gt 0 ]; then
+        sleep 1
+        main "$@"
+    fi
+}
+
+create_ca() { #()
+    if ! [ -e tls/certs/ca.crt ]; then
+        mkdir -p tls/ca/ tls/certs/ tls/csr/ tls/keys/
+        echo 'cluster: initializing CA...'
+        openssl req -x509 -sha384 -days 3652 \
+                -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 \
+                -keyout tls/ca/ca.key -nodes \
+                -subj "/CN=NSO-Raft-$$-$(hostname) CA" \
+                -out tls/ca/ca.crt 2>>tls.log
+        chmod 600 tls/ca/ca.key
+        cp -f tls/ca/ca.crt tls/certs/ca.crt
+        echo 'cluster: CA ready'
+    fi
+    if ! [ -e tls/ca/certext ]; then
+        echo 'subjectAltName=IP:127.0.0.1, IP:::1, DNS:127.0.0.1' > tls/ca/certext
+    fi
+}
+
+create_cert() { #(node_id)
+    nn="$1"
+    if ! [ -e "tls/certs/$nn.crt" ]; then
+        if ! [ -e "tls/csr/$nn.csr" ]; then
+            openssl req \
+                    -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 \
+                    -keyout "tls/keys/$nn.key" -nodes \
+                    -subj "/CN=$nn" -out "tls/csr/$nn.csr" 2>>tls.log
+        fi
+        openssl x509 -req \
+                -CA tls/ca/ca.crt -CAkey tls/ca/ca.key -CAcreateserial \
+                -sha384 -days 3652 -extfile tls/ca/certext \
+                -in "tls/csr/$nn.csr" -out "tls/certs/$nn.crt" 2>>tls.log
+    fi
+}
+
+create_ncs_conf_tpl() { #()
+    if [ -e ncs.conf ]; then return 0; fi
+
+    if [ -e configure.sh ]; then
+        configure='( . ./configure.sh )'
+    else
+        configure='cat'
+    fi
+
+    cat "$NCS_DIR/etc/ncs/ncs.conf" \
+        | edit_config add /ncs-config '
+  <ncs-ipc-address>
+    <port>456~{ID}</port>
+  </ncs-ipc-address>'"$nl" \
+        | edit_config set /ncs-config/cli/prompt1 '\u@n~{ID}> ' \
+        | edit_config set /ncs-config/cli/prompt2 '\u@n~{ID}% ' \
+        | edit_config set /ncs-config/cli/c-prompt1 '\u@n~{ID}# ' \
+        | edit_config set /ncs-config/cli/c-prompt2 '\u@n~{ID}(\m)# ' \
+        | edit_config set /ncs-config/cli/ssh/port '203~{ID}' \
+        | edit_config add /ncs-config/cli/ssh '
+      <ha-primary-listen>
+        <ip>127.0.0.1</ip>
+        <port>2022</port>
+      </ha-primary-listen>' \
+        | edit_config set /ncs-config/netconf-north-bound/transport/ssh/port '201~{ID}' \
+        | edit_config add /ncs-config/netconf-north-bound/transport/ssh '
+        <ha-primary-listen>
+          <ip>127.0.0.1</ip>
+          <port>2024</port>
+        </ha-primary-listen>' \
+        | edit_config set /ncs-config/webui/transport/tcp/port '808~{ID}' \
+        | edit_config add /ncs-config/webui/transport/tcp '
+        <ha-primary-listen>
+          <ip>127.0.0.1</ip>
+          <port>8080</port>
+        </ha-primary-listen>' \
+        | edit_config add /ncs-config '
+  <ha-raft>
+    <enabled>true</enabled>
+    <cluster-name>stockholm</cluster-name>
+    <listen>
+      <node-address>ncsd~{ID}@127.0.0.1</node-address>
+    </listen>
+    <seed-nodes>
+      <seed-node>ncsd2@127.0.0.1</seed-node>
+    </seed-nodes>
+    <ssl>
+      <ca-cert-file>ca.crt</ca-cert-file>
+      <cert-file>ncsd~{ID}.crt</cert-file>
+      <key-file>ncsd~{ID}.key</key-file>
+    </ssl>
+  </ha-raft>' \
+       | eval "$configure" > ncs.conf
+}
+
+create_node_dirs() { #(node_id, [node_id, ...])
+    for n in "$@"; do
+        [ -d "node$n" ] || ncs-setup --dest "node$n"
+        if ! [ -e "node$n/node_id" ]; then
+            echo "node$n: initializing..."
+            create_cert "ncsd$n"
+            cp -f tls/certs/ca.crt "tls/certs/ncsd$n.crt" "tls/keys/ncsd$n.key" "node$n/"
+            cat ncs.conf | sed -e "s/~{ID}/$n/g" > "node$n/ncs.conf"
+            echo "$n" > "node$n/node_id"
+            echo "node$n: initialized"
+        fi
+    done
+}
+
+edit_config() { #(cmd, path, [data])}
+    case $1 in
+        add)     cmd='-a' ;;
+        delete)  cmd='-d' ;;
+        replace) cmd='-R' ;;
+        set)     cmd='-e' ;;
+        *)       errorout 1 'unknown edit command' ;;
+    esac
+    path=$(echo "$2" | sed -e 's|/| |g')
+
+    if [ -n "$3" ]; then
+        ncs_conf_tool $cmd "$3" $path
+    else
+        ncs_conf_tool $cmd $path
+    fi
+}
+
+errorout() { #(exit_code, msg)
+    echo "error: $2" >&2
+    if [ -n "$1" ]; then
+        exit $1
+    fi
+}
+
+get_leader_id() { #(), sets $nid
+    nid=''
+    for nd in node*/node_id; do
+        n=$(printf '%d\n' $(cat "$nd"))
+        role=$(NCS_IPC_PORT=456$n ncs_cmd -x system -o \
+            -c 'mrtrans; mget "/ha-raft/status/role"' || true)
+        if [ "$role" = 'leader' ]; then
+            nid=$n
+            break
+        fi
+    done
+}
+
+get_node_id() { #([node_id|node_dir]), sets $nid
+    if [ -e "node$1/node_id" ]; then
+        nid=$(cat "node$1/node_id")
+    elif [ -e "$1/node_id" ]; then
+        nid=$(cat "$1/node_id")
+    else
+        errorout 1 "unknown or nonexistent node '$1'"
+    fi
+    # We expect an integer
+    nid=$(printf '%d\n' "$nid")
+}
+
+get_node_status() { #(node_id)
+    NCS_IPC_PORT=456$1 ncs --status 2>/dev/null | grep '^status: ' || true
+}
+
+help() { #([cmdname])
+    if [ -n "$1" ]; then
+        errorout '' "unrecognized argument: $1"
+    fi
+
+    echo 'usage:'
+    echo '    ncs-raftsim [--dir <path>] cli [[<node>] <ncs_cli_args>]'
+    echo '    ncs-raftsim [--dir <path>] create|reset|start|stop [<node> ...]'
+    echo '    ncs-raftsim [--dir <path>] join [<node1> <node2> ...]'
+    echo '    ncs-raftsim [--dir <path>] purge'
+    echo '    ncs-raftsim [--dir <path>] reup|up [cli ...]'
+    echo '    ncs-raftsim [--dir <path>] tls_info <node>'
+    echo ''
+    echo '  where <node> is short or long node name (e.g. "node1" or "1")'
+}
+
+node_cli() { #(node_id, cmd...)
+    n=$1; shift
+    echo "$@" | NCS_IPC_PORT=456$n ncs_cli -nsCu admin --noaaa
+}
+
+main_first_run=true
+main() { #(args)
+    cmd=$1; shift || true
+    need_dir=true
+    case $cmd in
+        cli)      ;;
+        create)   need_dir=false ;;
+        join)     ;;
+        purge)    ;;
+        reset)    ;;
+        reup)     need_dir=false ;;
+        start)    ;;
+        status)   ;;
+        stop)     ;;
+        tls_info) ;;
+        up)       need_dir=false ;;
+        *)
+            help "$cmd"
+            exit 1
+            ;;
+    esac
+    if $main_first_run; then
+        main_first_run=false
+        if ! [ -d "$DATADIR" ]; then
+            if $need_dir; then
+                errorout 2 "expecting existing cluster in: $DATADIR"
+            else
+                echo "cluster: creating new cluster in: $DATADIR"
+                mkdir -p "$DATADIR"
+            fi
+        fi
+        cd "$DATADIR"
+    fi
+    "cmd_$cmd" "$@"
+}
+
+
+if [ -z "$NCS_DIR" ]; then
+    errorout 1 'NCS_DIR must be set'
+fi
+while [ $# -gt 0 ]; do
+    case $1 in
+        --dir)
+            shift
+            DATADIR=$1; shift
+            ;;
+        --help)
+            help
+            exit 0
+            ;;
+        --*)
+            help "$1"
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+main "$@"
